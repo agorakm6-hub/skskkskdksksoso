@@ -80,18 +80,25 @@ async def send(chat, text, kb=None):
 
 
 async def edit_offer(o, text, kb=None):
+    """editMessageText с защитой от MESSAGE_NOT_MODIFIED — иначе спиннер на кнопке зависает."""
     params = dict(text=text, parse_mode="HTML",
                   link_preview_options={"is_disabled": True},
                   reply_markup=kb or {"inline_keyboard": []})
     if o.get("inline_message_id"):
         params["inline_message_id"] = o["inline_message_id"]
-    else:
+    elif o.get("chat") and o.get("mid"):
         params["chat_id"], params["message_id"] = o["chat"], o["mid"]
-    return await api("editMessageText", **params)
+    else:
+        log.warning("edit_offer: некуда редактировать оффер %s", o.get("id"))
+        return {"ok": False, "description": "no target"}
+    res = await api("editMessageText", **params)
+    if not res.get("ok") and "not modified" in (res.get("description") or "").lower():
+        return {"ok": True}
+    return res
 
 
 def save():
-    for oid in sorted(offers, key=lambda k: offers[k]["created"])[:-500]:
+    for oid in sorted(offers, key=lambda k: offers[k].get("created", 0))[:-500]:
         del offers[oid]
     tmp = f"{DATA_FILE}.tmp"
     try:
@@ -231,16 +238,27 @@ def inline_cb(o, action):
 
 
 def cb(o, action):
+    """Единая точка: для инлайн-оффера всегда пробуем self-contained oi:-токен.
+    Если не влез — падаем в stored-оффер (но тогда кнопка how тоже будет of:-токеном
+    и обработается в on_stored_cb — это нормально, оффер уже лежит в offers)."""
     token = inline_cb(o, action)
     if token:
         return token
-    # слишком длинный слаг/имя не влез в 64 байта — держим как обычный оффер в памяти
-    now = time.time()
-    o = {**o, "mode": "stored", "chat": None, "mid": None,
-         "status": "pending", "created": now, "expires": now + OFFER_TTL}
-    offers[o["id"]] = o
-    save()
-    return f"of:{action}:{o['id']}"
+    oid = o.get("id")
+    if not oid or oid not in offers:
+        # материализуем оффер, чтобы of:-токен имел куда смотреть
+        now = time.time()
+        oid = oid or uuid.uuid4().hex[:8]
+        stored = {**o, "id": oid, "mode": "stored",
+                  "status": o.get("status", "pending"),
+                  "created": o.get("created", now),
+                  "expires": o.get("expires", now + OFFER_TTL)}
+        stored.setdefault("chat", None)
+        stored.setdefault("mid", None)
+        stored.setdefault("inline_message_id", None)
+        offers[oid] = stored
+        save()
+    return f"of:{action}:{oid}"
 
 
 def offer_kb(o):
@@ -263,7 +281,6 @@ def back_kb(o):
 # ── оффер: создание и жизненный цикл ────────────────────────
 
 async def create_offer(arg, maker, chat, to_name):
-    """Шлёт оффер в chat. Ошибки уходят только в личку с ботом, собеседник их не видит."""
     parsed, error = parse_offer(arg)
     if error:
         return await send(chat, f"⚠️ {error}\n\n{USAGE}")
@@ -280,13 +297,13 @@ async def create_offer(arg, maker, chat, to_name):
     save()
 
 
-FINAL = {"accepted": (sold_text, sold_kb, "принят"),
-         "declined": (declined_text, None, "отклонён"),
-         "expired": (expired_text, None, "истёк")}
+FINAL = {"accepted": (sold_text, sold_kb),
+         "declined": (declined_text, None),
+         "expired": (expired_text, None)}
 
 
 async def settle(o, status):
-    text, kb, label = FINAL[status]
+    text, kb = FINAL[status]
     o["status"] = status
     save()
     await edit_offer(o, text(o), kb(o) if kb else None)
@@ -313,6 +330,240 @@ def decode_inline_cb(data):
     return action, {"id": None, "slug": slug, "name": gift_name(slug) or slug,
                     "stars": ub36(stars_b36), "mode": "inline", "maker": maker,
                     "inline_message_id": None}
+
+
+async def on_inline_cb(q):
+    try:
+        action, o = decode_inline_cb(q["data"])
+    except (ValueError, IndexError):
+        return "Повреждённые данные оффера"
+    o["inline_message_id"] = q.get("inline_message_id")
+    if STRICT and q["from"]["id"] == o["maker"]["id"] and action in ("ok", "no"):
+        return "Это твой оффер: отвечать на него должен получатель"
+    if action == "ok":
+        await edit_offer(o, sold_text(o), sold_kb(o))
+    elif action == "no":
+        await edit_offer(o, declined_text(o), None)
+    elif action == "how":
+        await edit_offer(o, how_text(o), back_kb(o))
+    elif action == "back":
+        await edit_offer(o, sold_text(o), sold_kb(o))
+    return None
+
+
+async def on_stored_cb(q):
+    parts = q.get("data", "").split(":")
+    o = offers.get(parts[2]) if len(parts) == 3 else None
+    if o is None:
+        return "Этот оффер устарел"
+    if q.get("inline_message_id"):
+        o["inline_message_id"] = q["inline_message_id"]
+        save()
+    action = parts[1]
+    if STRICT and q["from"]["id"] == o["maker"]["id"] and action in ("ok", "no"):
+        return "Это твой оффер: отвечать на него должен получатель"
+    if action in ("ok", "no"):
+        if o["status"] != "pending":
+            return "Оффер уже обработан"
+        if time.time() > o["expires"]:
+            await settle(o, "expired")
+            return "Срок предложения истёк"
+        await settle(o, "accepted" if action == "ok" else "declined")
+    elif o["status"] == "accepted" and action == "how":
+        await edit_offer(o, how_text(o), back_kb(o))
+    elif o["status"] == "accepted" and action == "back":
+        await edit_offer(o, sold_text(o), sold_kb(o))
+    return None
+
+
+async def on_callback(q):
+    """ГЛАВНОЕ: всегда отвечаем на callback_query, иначе у клиента крутится спиннер."""
+    data = q.get("data", "")
+    note = None
+    try:
+        if data == "try:demo":
+            frm = q["from"]
+            maker = {"id": frm["id"], "name": frm.get("first_name", ""),
+                     "username": frm.get("username")}
+            await create_offer("https://t.me/nft/DurovsCap-1234 500", maker,
+                               q["message"]["chat"]["id"], "предпросмотр")
+            note = "Отправил пример оффера 👇"
+        else:
+            note = await (on_inline_cb(q) if data.startswith("oi:") else on_stored_cb(q))
+    except Exception:
+        log.exception("callback %s", data)
+        note = "Что-то пошло не так, попробуй ещё раз"
+    finally:
+        extra = {"text": note, "show_alert": True} if note else {}
+        await api("answerCallbackQuery", callback_query_id=q["id"], **extra)
+
+
+# ── инлайн-режим ────────────────────────────────────────────
+
+def inline_preview(oid, parsed, frm):
+    return {"id": oid, **parsed, "mode": "inline",
+            "maker": {"id": frm["id"], "name": frm.get("first_name", ""),
+                      "username": frm.get("username")},
+            "expires": time.time() + OFFER_TTL}
+
+
+async def on_inline_query(q):
+    query = q.get("query", "").strip()
+    if not query:
+        return await api("answerInlineQuery", inline_query_id=q["id"], results=[],
+                         cache_time=1, switch_pm_text="Как создать оффер",
+                         switch_pm_parameter="help")
+    parsed, error = parse_offer(query)
+    if error:
+        result = {"type": "article", "id": "err",
+                  "title": "Не распознал ссылку или сумму",
+                  "description": error,
+                  "input_message_content": {
+                      "message_text": f"⚠️ {esc(error)}\n\n{USAGE}",
+                      "parse_mode": "HTML"}}
+        return await api("answerInlineQuery", inline_query_id=q["id"],
+                         results=[result], cache_time=1)
+    oid = uuid.uuid4().hex[:8]
+    o = inline_preview(oid, parsed, q["from"])
+    result = {"type": "article", "id": oid,
+              "title": f"Оффер: {parsed['name']}",
+              "description": f"{num(parsed['stars'])} ⭐ — нажми, чтобы отправить сюда",
+              "input_message_content": {
+                  "message_text": offer_text(o), "parse_mode": "HTML",
+                  "link_preview_options": {"is_disabled": True}},
+              "reply_markup": offer_kb(o)}
+    await api("answerInlineQuery", inline_query_id=q["id"],
+              results=[result], cache_time=1)
+
+
+# ── личка с ботом ───────────────────────────────────────────
+
+def start_text():
+    return (
+        f"👋 <b>Оффер-бот @{esc(bot_name)}</b>\n\n"
+        "Создаёт карточки-офферы на NFT: цена + кнопки «Принять» / «Отклонить», "
+        "как в самом Telegram.\n\n"
+        "<b>Как отправить оффер:</b>\n"
+        f"В любом чате набери <code>@{esc(bot_name)}</code> и через пробел ссылку и сумму:\n"
+        f"<code>@{esc(bot_name)} https://t.me/nft/DurovsCap-1234 500</code>\n\n"
+        "Сверху появится карточка — тапни её, и оффер уйдёт в чат.\n\n"
+        "<b>Попробуй прямо сейчас</b> — жми кнопку ниже, я пришлю пример оффера "
+        "в этот чат."
+    )
+
+
+def start_kb():
+    return {"inline_keyboard": [
+        [{"text": "🧪 Попробовать предпросмотр", "callback_data": "try:demo"}],
+        [{"text": "📋 Скопировать ник бота",
+          "copy_text": {"text": f"@{bot_name}"}}],
+    ]}
+
+
+async def on_message(m):
+    chat, frm = m["chat"]["id"], m.get("from") or {}
+    cmd, _, arg = (m.get("text") or "").strip().partition(" ")
+    cmd = cmd.split("@")[0].lower()
+    if cmd in ("/start", "/help"):
+        await send(chat, start_text(), start_kb())
+    elif cmd == "/offer":
+        if not arg.strip():
+            return await send(chat, USAGE)
+        maker = {"id": frm.get("id", 0), "name": frm.get("first_name", ""),
+                 "username": frm.get("username")}
+        await create_offer(arg, maker, chat, "предпросмотр")
+
+
+async def handle(update):
+    try:
+        if "callback_query" in update:
+            await on_callback(update["callback_query"])
+        elif "inline_query" in update:
+            await on_inline_query(update["inline_query"])
+        elif "message" in update:
+            await on_message(update["message"])
+    except Exception:
+        log.exception("апдейт %s", update.get("update_id"))
+
+
+# ── запуск ──────────────────────────────────────────────────
+
+async def webhook(req):
+    token = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(token.encode(), SECRET.encode()):
+        return web.Response(status=403)
+    try:
+        update = await req.json()
+    except ValueError:
+        return web.Response(status=400)
+    background(handle(update))
+    return web.Response(text="ok")
+
+
+async def health(req):
+    return web.Response(text="ok")
+
+
+async def keepalive():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with http.get(f"{PUBLIC_URL}/health") as resp:
+                await resp.read()
+        except Exception as e:
+            log.warning("keepalive: %s", e)
+
+
+async def poll_updates():
+    await api("deleteWebhook")
+    offset = 0
+    while True:
+        try:
+            data = await api("getUpdates", offset=offset, timeout=30,
+                             allowed_updates=UPDATES)
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                background(handle(update))
+            if not data.get("ok"):
+                await asyncio.sleep(3)
+        except Exception as e:
+            log.warning("getUpdates: %s", e)
+            await asyncio.sleep(3)
+
+
+async def main():
+    global http, bot_name
+    http = ClientSession(timeout=ClientTimeout(total=70))
+    load()
+    me = (await api("getMe")).get("result") or {}
+    if not me:
+        raise SystemExit("BOT_TOKEN не подходит")
+    bot_name = me["username"]
+    log.info("юзернейм бота: @%s (https://t.me/%s)", bot_name, bot_name)
+    if me.get("supports_inline_queries") is False:
+        log.warning("У бота выключен инлайн-режим: BotFather → /setinline → включить для @%s", bot_name)
+    await api("setMyCommands", commands=[
+        {"command": "start", "description": "Подсказки и предпросмотр"},
+        {"command": "offer", "description": "Предпросмотр оффера: ссылка сумма"}])
+    background(sweeper())
+    if PUBLIC_URL:
+        app = web.Application()
+        app.router.add_get("/health", health)
+        app.router.add_post("/webhook", webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+        await api("setWebhook", url=f"{PUBLIC_URL}/webhook", secret_token=SECRET,
+                  allowed_updates=UPDATES, drop_pending_updates=True)
+        background(keepalive())
+    else:
+        background(poll_updates())
+    log.info("оффер-бот @%s запущен", bot_name)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())                  "inline_message_id": None}
 
 
 async def on_inline_cb(q):
