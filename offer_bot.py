@@ -80,7 +80,6 @@ async def send(chat, text, kb=None):
 
 
 async def edit_offer(o, text, kb=None):
-    """editMessageText с защитой от MESSAGE_NOT_MODIFIED — иначе спиннер на кнопке зависает."""
     params = dict(text=text, parse_mode="HTML",
                   link_preview_options={"is_disabled": True},
                   reply_markup=kb or {"inline_keyboard": []})
@@ -89,7 +88,7 @@ async def edit_offer(o, text, kb=None):
     elif o.get("chat") and o.get("mid"):
         params["chat_id"], params["message_id"] = o["chat"], o["mid"]
     else:
-        log.warning("edit_offer: некуда редактировать оффер %s", o.get("id"))
+        log.error("edit_offer: некуда редактировать оффер %s", o)
         return {"ok": False, "description": "no target"}
     res = await api("editMessageText", **params)
     if not res.get("ok") and "not modified" in (res.get("description") or "").lower():
@@ -237,28 +236,36 @@ def inline_cb(o, action):
     return data if len(data.encode()) <= 64 else None
 
 
+def _materialize(o):
+    """Кладёт оффер в offers, если его там ещё нет (по id или по inline_message_id)."""
+    imid = o.get("inline_message_id")
+    if imid:
+        for stored in offers.values():
+            if stored.get("inline_message_id") == imid:
+                return stored
+    oid = o.get("id")
+    if oid and oid in offers:
+        return offers[oid]
+    now = time.time()
+    oid = oid or uuid.uuid4().hex[:8]
+    stored = {**o, "id": oid, "mode": o.get("mode", "inline"),
+              "status": o.get("status", "pending"),
+              "created": o.get("created", now),
+              "expires": o.get("expires", now + OFFER_TTL)}
+    stored.setdefault("chat", None)
+    stored.setdefault("mid", None)
+    stored.setdefault("inline_message_id", None)
+    offers[oid] = stored
+    save()
+    return stored
+
+
 def cb(o, action):
-    """Единая точка: для инлайн-оффера всегда пробуем self-contained oi:-токен.
-    Если не влез — падаем в stored-оффер (но тогда кнопка how тоже будет of:-токеном
-    и обработается в on_stored_cb — это нормально, оффер уже лежит в offers)."""
     token = inline_cb(o, action)
     if token:
         return token
-    oid = o.get("id")
-    if not oid or oid not in offers:
-        # материализуем оффер, чтобы of:-токен имел куда смотреть
-        now = time.time()
-        oid = oid or uuid.uuid4().hex[:8]
-        stored = {**o, "id": oid, "mode": "stored",
-                  "status": o.get("status", "pending"),
-                  "created": o.get("created", now),
-                  "expires": o.get("expires", now + OFFER_TTL)}
-        stored.setdefault("chat", None)
-        stored.setdefault("mid", None)
-        stored.setdefault("inline_message_id", None)
-        offers[oid] = stored
-        save()
-    return f"of:{action}:{oid}"
+    stored = _materialize(o)
+    return f"of:{action}:{stored['id']}"
 
 
 def offer_kb(o):
@@ -313,7 +320,7 @@ async def sweeper():
     while True:
         await asyncio.sleep(60)
         for o in list(offers.values()):
-            if o["status"] == "pending" and o["expires"] < time.time():
+            if o.get("status") == "pending" and o.get("expires", 0) < time.time():
                 try:
                     await settle(o, "expired")
                 except Exception:
@@ -340,14 +347,20 @@ async def on_inline_cb(q):
     o["inline_message_id"] = q.get("inline_message_id")
     if STRICT and q["from"]["id"] == o["maker"]["id"] and action in ("ok", "no"):
         return "Это твой оффер: отвечать на него должен получатель"
+    # Материализуем: чтобы how/back нашли оффер по inline_message_id
+    stored = _materialize(o)
     if action == "ok":
-        await edit_offer(o, sold_text(o), sold_kb(o))
+        stored["status"] = "accepted"
+        save()
+        await edit_offer(stored, sold_text(stored), sold_kb(stored))
     elif action == "no":
-        await edit_offer(o, declined_text(o), None)
+        stored["status"] = "declined"
+        save()
+        await edit_offer(stored, declined_text(stored), None)
     elif action == "how":
-        await edit_offer(o, how_text(o), back_kb(o))
+        await edit_offer(stored, how_text(stored), back_kb(stored))
     elif action == "back":
-        await edit_offer(o, sold_text(o), sold_kb(o))
+        await edit_offer(stored, sold_text(stored), sold_kb(stored))
     return None
 
 
@@ -369,15 +382,14 @@ async def on_stored_cb(q):
             await settle(o, "expired")
             return "Срок предложения истёк"
         await settle(o, "accepted" if action == "ok" else "declined")
-    elif o["status"] == "accepted" and action == "how":
+    elif action == "how" and o["status"] in ("accepted", "pending"):
         await edit_offer(o, how_text(o), back_kb(o))
-    elif o["status"] == "accepted" and action == "back":
+    elif action == "back" and o["status"] in ("accepted", "pending"):
         await edit_offer(o, sold_text(o), sold_kb(o))
     return None
 
 
 async def on_callback(q):
-    """ГЛАВНОЕ: всегда отвечаем на callback_query, иначе у клиента крутится спиннер."""
     data = q.get("data", "")
     note = None
     try:
