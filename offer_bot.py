@@ -1,0 +1,601 @@
+"""Оффер-бот: офферы на NFT в чатах через Telegram Business.
+
+Подключаешь бота к аккаунту (Настройки → Telegram Business → Чат-боты), пишешь
+в чате с человеком /offer ссылка сумма, и бот от твоего имени отправляет карточку
+оффера с кнопками «Принять» и «Отклонить». Всё чисто визуальное: подарки никуда
+не передаются, это прототип интерфейса.
+
+Если написать /offer прямо боту в личку, оффер покажется там как предпросмотр.
+Работает и без Telegram Premium.
+"""
+import asyncio
+import hmac
+import html
+import json
+import logging
+import math
+import os
+import re
+import time
+import uuid
+
+from aiohttp import ClientSession, ClientTimeout, web
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("offers")
+
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+PUBLIC_URL = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
+SECRET = os.environ.get("WEBHOOK_SECRET") or BOT_TOKEN.split(":")[1][:32]
+API = f"{os.environ.get('TG_API', 'https://api.telegram.org')}/bot{BOT_TOKEN}"
+DATA_FILE = os.environ.get("OFFERS_FILE", "offers.json")
+
+BRAND = os.environ.get("BRAND", "Telegram")  # как называется «Telegram» в текстах; для приватки поставь «Арбуз Грам»
+TEST_NOTICE = os.environ.get("TEST_NOTICE", "")  # сюда можно вернуть "🧪 Тестовый оффер: не принимайте, это проверка."
+OFFER_TTL = int(float(os.environ.get("OFFER_HOURS", 6)) * 3600)
+STRICT = os.environ.get("OFFER_STRICT") == "1"  # 1: принять/отклонить может только не автор оффера
+MAX_STARS = 100_000_000
+UPDATES = ["message", "callback_query", "business_connection", "business_message", "inline_query"]
+NBSP = "\u00a0"
+
+http = None
+bot_name = ""
+connections, offers = {}, {}
+tasks = set()
+
+
+# ── утилиты ─────────────────────────────────────────────────
+
+def esc(s):
+    return html.escape(str(s))
+
+
+def num(x):
+    return f"{x:,}".replace(",", NBSP)
+
+
+def btn(text, data):
+    return {"text": text, "callback_data": data}
+
+
+def background(coro):
+    task = asyncio.create_task(coro)
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
+
+
+async def api(method, **params):
+    async with http.post(f"{API}/{method}", json=params) as resp:
+        data = await resp.json()
+    if not data.get("ok"):
+        log.warning("%s: %s", method, data.get("description", data))
+    return data
+
+
+async def send(chat, text, kb=None, bcid=None):
+    params = dict(chat_id=chat, text=text, parse_mode="HTML", link_preview_options={"is_disabled": True})
+    if kb:
+        params["reply_markup"] = kb
+    if bcid:
+        params["business_connection_id"] = bcid  # сообщение уйдёт от имени владельца аккаунта
+    return await api("sendMessage", **params)
+
+
+async def edit_offer(o, text, kb=None):
+    params = dict(text=text, parse_mode="HTML", link_preview_options={"is_disabled": True},
+                  reply_markup=kb or {"inline_keyboard": []})
+    if o.get("inline_message_id"):  # оффер отправлен через @бот в инлайне, у него нет chat_id/message_id
+        params["inline_message_id"] = o["inline_message_id"]
+    else:
+        params["chat_id"], params["message_id"] = o["chat"], o["mid"]
+        if o["bcid"]:
+            params["business_connection_id"] = o["bcid"]
+    return await api("editMessageText", **params)
+
+
+def save():
+    for oid in sorted(offers, key=lambda k: offers[k]["created"])[:-500]:  # храним последние 500
+        del offers[oid]
+    tmp = f"{DATA_FILE}.tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"connections": connections, "offers": offers}, f, ensure_ascii=False)
+        os.replace(tmp, DATA_FILE)
+    except OSError as e:
+        log.error("не удалось сохранить %s: %s", DATA_FILE, e)
+
+
+def load():
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as e:
+        log.error("%s не читается: %s", DATA_FILE, e)
+        return
+    connections.update(data.get("connections", {}))
+    offers.update(data.get("offers", {}))
+
+
+# ── разбор команды ──────────────────────────────────────────
+
+NFT_LINK = re.compile(r"(?:https?://)?t\.me/nft/([A-Za-z0-9_-]+)", re.I)
+SLUG = re.compile(r"^(.+)-(\d+)$")
+USAGE = ("Формат: <code>/offer ссылка сумма</code>\n"
+         "Пример: <code>/offer https://t.me/nft/DurovsCap-1234 500</code>\n"
+         "Сумма в звёздах: столько придёт после принятия.")
+
+
+def gift_name(slug):
+    """DurovsCap-1234 -> «Durovs Cap #1234»."""
+    m = SLUG.match(slug)
+    if not m:
+        return None
+    return f"{re.sub(r'(?<=[a-z0-9])(?=[A-Z])', ' ', m.group(1))} #{m.group(2)}"
+
+
+def parse_offer(arg):
+    """Возвращает (данные, None) или (None, текст ошибки). Порядок ссылки и суммы не важен."""
+    link = NFT_LINK.search(arg)
+    if not link:
+        return None, "Не нашёл ссылку на NFT вида https://t.me/nft/DurovsCap-1234"
+    slug = link.group(1)
+    name = gift_name(slug)
+    if not name:
+        return None, "Это не похоже на ссылку на NFT: в конце должен быть номер, например DurovsCap-1234."
+    rest = f"{arg[:link.start()]} {arg[link.end():]}"
+    amount = re.search(r"\d[\d_,]*", rest)
+    if not amount:
+        return None, "Не нашёл сумму в звёздах."
+    stars = int(re.sub(r"[_,]", "", amount.group()))
+    if not 1 <= stars <= MAX_STARS:
+        return None, f"Сумма должна быть от 1 до {num(MAX_STARS)} звёзд."
+    return {"slug": slug, "name": name, "stars": stars}, None
+
+
+# ── тексты и кнопки оффера ──────────────────────────────────
+
+def who(o):
+    u = o["maker"]
+    return f"@{u['username']}" if u.get("username") else u["name"] or "покупатель"
+
+
+def gift_link(o):
+    return f'<a href="https://t.me/nft/{esc(o["slug"])}">{esc(o["name"])}</a>'
+
+
+def stars(o):
+    return f"{num(o['stars'])}{NBSP}⭐"
+
+
+def left_text(seconds):
+    minutes = math.ceil(max(0, seconds) / 60)
+    h, m = divmod(minutes, 60)
+    return f"{h} ч. {m} мин." if h else f"{m} мин."
+
+
+def offer_text(o):
+    text = (f"Пользователь предлагает Вам {stars(o)} Звёзд за подарок {gift_link(o)}.\n\n"
+            f"Предложение действует ещё {left_text(o['expires'] - time.time())}")
+    return text + (f"\n\n{esc(TEST_NOTICE)}" if TEST_NOTICE else "")
+
+
+def sold_text(o):
+    return (f"✅ Подарок {gift_link(o)} был успешно продан за {stars(o)}!\n\n"
+            "Для завершения передайте подарок покупателю, чтобы получить свои Звёзды.")
+
+
+def how_text(o):
+    return (f"<b>Как передать подарок пользователю:\n{esc(who(o))}</b>\n\n"
+            f"1. Передайте подарок пользователю: {esc(who(o))}.\n"
+            f"2. Нажмите «Передать NFT» и выберите {esc(o['name'])}.\n"
+            "3. Подтвердите передачу подарка.\n\n"
+            f"{esc(BRAND)} зафиксирует транзакцию и моментально зачислит оплату на ваш баланс. "
+            "Резерв действует 24 часа.")
+
+
+def declined_text(o):
+    return f"❌ Предложение {stars(o)} за подарок {gift_link(o)} отклонено."
+
+
+def expired_text(o):
+    return f"⌛ Предложение {stars(o)} за подарок {gift_link(o)} истекло."
+
+
+B36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def b36(n):
+    n = int(n)
+    if n == 0:
+        return "0"
+    out = []
+    while n:
+        n, r = divmod(n, 36)
+        out.append(B36[r])
+    return "".join(reversed(out))
+
+
+def ub36(s):
+    return int(s, 36)
+
+
+def inline_cb(o, action):
+    """Все данные оффера укладываем прямо в callback_data: кнопка срабатывает сама по себе,
+    без обращения к памяти бота. Для инлайн-офферов это надёжнее, чем chosen_inline_result,
+    который Telegram шлёт только если включить инлайн-фидбэк у @BotFather."""
+    u = o["maker"]
+    username = u.get("username") or ""
+    label = (username or u.get("name") or "")[:16]
+    data = f"oi:{action}:{o['slug']}:{b36(o['stars'])}:{b36(u['id'])}:{'u' if username else 'n'}{label}"
+    return data if len(data.encode()) <= 64 else None
+
+
+def cb(o, action):
+    """callback_data для кнопки: компактная self-contained схема для инлайн-офферов,
+    иначе (бизнес/личка) — ссылка на запись в памяти бота, как раньше."""
+    token = inline_cb(o, action) if o.get("mode") == "inline" else None
+    if token:
+        return token
+    if o.get("mode") == "inline":  # слишком длинный слаг/имя не влез в 64 байта — держим как обычный оффер
+        now = time.time()
+        o = {**o, "mode": "stored", "bcid": None, "chat": None, "mid": None, "to": None, "owner_chat": None,
+             "status": "pending", "created": now, "expires": now + OFFER_TTL}
+        offers[o["id"]] = o
+        save()
+    return f"of:{action}:{o['id']}"
+
+
+def offer_kb(o):
+    return {"inline_keyboard": [[btn("Отклонить", cb(o, "no")), btn("Принять", cb(o, "ok"))]]}
+
+
+def sold_kb(o):
+    u = o["maker"]
+    if u.get("username"):
+        transfer = {"text": f"Передать NFT @{u['username']}", "url": f"https://t.me/{u['username']}"}
+    else:
+        transfer = {"text": "Передать NFT", "url": f"tg://user?id={u['id']}"}
+    return {"inline_keyboard": [[transfer], [btn("Как передать", cb(o, "how"))]]}
+
+
+def back_kb(o):
+    return {"inline_keyboard": [[btn("Вернуться к передаче", cb(o, "back"))]]}
+
+
+# ── оффер: создание и жизненный цикл ────────────────────────
+
+async def create_offer(arg, maker, chat, to_name, bcid, owner_chat):
+    """Шлёт оффер в chat. Ошибки уходят только владельцу в личку с ботом, собеседник их не видит."""
+    parsed, error = parse_offer(arg)
+    if error:
+        return await send(owner_chat, f"⚠️ {error}\n\n{USAGE}")
+    now = time.time()
+    o = {"id": uuid.uuid4().hex[:8], **parsed, "bcid": bcid, "chat": chat, "mid": None,
+         "inline_message_id": None, "maker": maker, "to": to_name,
+         "owner_chat": owner_chat if bcid else None, "status": "pending",
+         "created": now, "expires": now + OFFER_TTL}
+    res = await send(chat, offer_text(o), offer_kb(o), bcid)
+    if not res.get("ok"):
+        return await send(owner_chat, "⚠️ Telegram не дал отправить оффер в чат: "
+                                      f"{esc(res.get('description', 'неизвестная ошибка'))}")
+    o["mid"] = res["result"]["message_id"]
+    offers[o["id"]] = o
+    save()
+    if bcid:
+        await send(owner_chat, f"📤 Оффер на {esc(o['name'])} за {stars(o)} отправлен в чат с {esc(to_name)}.")
+
+
+async def tell_owner(o, what):
+    if o.get("owner_chat"):
+        await send(o["owner_chat"], f"📬 Оффер на {esc(o['name'])} ({stars(o)}): {what}. Чат: {esc(o['to'])}")
+
+
+FINAL = {"accepted": (sold_text, sold_kb, "принят"),
+         "declined": (declined_text, None, "отклонён"),
+         "expired": (expired_text, None, "истёк")}
+
+
+async def settle(o, status):
+    text, kb, label = FINAL[status]
+    o["status"] = status
+    save()
+    await edit_offer(o, text(o), kb(o) if kb else None)
+    await tell_owner(o, label)
+
+
+async def sweeper():
+    """Раз в минуту гасит офферы, у которых вышел срок."""
+    while True:
+        await asyncio.sleep(60)
+        for o in list(offers.values()):
+            if o["status"] == "pending" and o["expires"] < time.time():
+                try:
+                    await settle(o, "expired")
+                except Exception:
+                    log.exception("истечение %s", o["id"])
+
+
+def decode_inline_cb(data):
+    _, action, slug, stars_b36, maker_b36, flaglabel = data.split(":", 5)
+    maker = {"id": ub36(maker_b36), "username": None, "name": ""}
+    if flaglabel[:1] == "u":
+        maker["username"] = flaglabel[1:]
+    else:
+        maker["name"] = flaglabel[1:]
+    return action, {"id": None, "slug": slug, "name": gift_name(slug) or slug, "stars": ub36(stars_b36),
+                    "mode": "inline", "maker": maker, "inline_message_id": None, "bcid": None}
+
+
+async def on_inline_cb(q):
+    """Оффер, рождённый инлайном: вся нужная информация лежит в самой кнопке, память бота не нужна."""
+    try:
+        action, o = decode_inline_cb(q["data"])
+    except (ValueError, IndexError):
+        return "Повреждённые данные оффера"
+    o["inline_message_id"] = q.get("inline_message_id")
+    if STRICT and q["from"]["id"] == o["maker"]["id"] and action in ("ok", "no"):
+        return "Это твой оффер: отвечать на него должен получатель"
+    if action == "ok":
+        await edit_offer(o, sold_text(o), sold_kb(o))
+    elif action == "no":
+        await edit_offer(o, declined_text(o), None)
+    elif action == "how":
+        await edit_offer(o, how_text(o), back_kb(o))
+    elif action == "back":
+        await edit_offer(o, sold_text(o), sold_kb(o))
+    return None
+
+
+async def on_stored_cb(q):
+    """Оффер из бизнес-режима или личного предпросмотра: ищем в памяти бота, как раньше."""
+    parts = q.get("data", "").split(":")
+    o = offers.get(parts[2]) if len(parts) == 3 else None
+    if o is None:
+        return "Этот оффер устарел"
+    if o.get("chat") is None and not o.get("inline_message_id") and q.get("inline_message_id"):
+        o["inline_message_id"] = q["inline_message_id"]  # редкий откат с длинным слагом: узнаём id только тут
+        save()
+    action = parts[1]
+    if STRICT and q["from"]["id"] == o["maker"]["id"] and action in ("ok", "no"):
+        return "Это твой оффер: отвечать на него должен получатель"
+    if action in ("ok", "no"):
+        if o["status"] != "pending":
+            return "Оффер уже обработан"
+        if time.time() > o["expires"]:
+            await settle(o, "expired")
+            return "Срок предложения истёк"
+        await settle(o, "accepted" if action == "ok" else "declined")
+    elif o["status"] == "accepted" and action == "how":
+        await edit_offer(o, how_text(o), back_kb(o))
+    elif o["status"] == "accepted" and action == "back":
+        await edit_offer(o, sold_text(o), sold_kb(o))
+    return None
+
+
+async def on_callback(q):
+    data = q.get("data", "")
+    note = await (on_inline_cb(q) if data.startswith("oi:") else on_stored_cb(q))
+    extra = {"text": note, "show_alert": True} if note else {}
+    await api("answerCallbackQuery", callback_query_id=q["id"], **extra)
+
+
+# ── подключение через Telegram Business ─────────────────────
+
+def conn_from(c):
+    rights = c.get("rights")
+    can_reply = bool(rights.get("can_reply")) if isinstance(rights, dict) else bool(c.get("can_reply"))
+    user = c["user"]
+    return {"id": c["id"], "user_id": user["id"], "chat": c["user_chat_id"], "name": user.get("first_name", ""),
+            "username": user.get("username"), "enabled": c.get("is_enabled", True), "can_reply": can_reply}
+
+
+async def on_connection(c):
+    conn = conn_from(c)
+    connections[conn["id"]] = conn
+    save()
+    if not conn["enabled"]:
+        text = "🔌 Бот отключён от аккаунта. Подключить снова: /start"
+    elif not conn["can_reply"]:
+        text = ("⚠️ Бот подключён, но без права «Отвечать на сообщения». Открой Настройки → Telegram Business → "
+                "Чат-боты, выбери бота и включи это разрешение, иначе офферы не отправятся.")
+    else:
+        text = ("✅ <b>Бот подключён к аккаунту.</b>\n\nТеперь в любом чате с человеком пиши:\n"
+                "<code>/offer ссылка сумма</code>\n"
+                "Например: <code>/offer https://t.me/nft/DurovsCap-1234 500</code>")
+    await send(conn["chat"], text)
+
+
+async def get_connection(bcid):
+    conn = connections.get(bcid)
+    if conn is None:  # после рестарта без файла подключение можно запросить у Telegram
+        res = await api("getBusinessConnection", business_connection_id=bcid)
+        if res.get("ok"):
+            conn = connections[bcid] = conn_from(res["result"])
+            save()
+    return conn
+
+
+async def on_business_message(m):
+    cmd, _, arg = (m.get("text") or "").strip().partition(" ")
+    if cmd.lower() != "/offer":
+        return
+    conn = await get_connection(m["business_connection_id"])
+    frm = m.get("from") or {}
+    if not conn or frm.get("id") != conn["user_id"]:  # команды принимаем только от владельца аккаунта
+        return
+    if not (conn["enabled"] and conn["can_reply"]):
+        return await send(conn["chat"], "⚠️ У бота нет права отвечать на сообщения, оффер не отправлен. "
+                                        "Включи его: Настройки → Telegram Business → Чат-боты.")
+    chat = m["chat"]
+    to_name = " ".join(x for x in (chat.get("first_name"), chat.get("last_name")) if x) or chat.get("title") or "собеседником"
+    maker = {"id": frm["id"], "name": frm.get("first_name", ""), "username": frm.get("username")}
+    await create_offer(arg, maker, chat["id"], to_name, conn["id"], conn["chat"])
+
+
+# ── инлайн-режим: @бот прямо в любом чате, без Business ─────
+
+def inline_preview(oid, parsed, frm):
+    """Заготовка оффера для ответа на инлайн-запрос: нужна только чтобы отрисовать текст и кнопки.
+    mode="inline" — кнопки несут данные оффера в себе (см. cb()), поэтому дальше боту не нужно
+    ни ловить chosen_inline_result, ни помнить этот оффер, чтобы кнопки сработали."""
+    return {"id": oid, **parsed, "mode": "inline", "maker": {"id": frm["id"], "name": frm.get("first_name", ""),
+            "username": frm.get("username")}, "expires": time.time() + OFFER_TTL}
+
+
+async def on_inline_query(q):
+    query = q.get("query", "").strip()
+    if not query:
+        return await api("answerInlineQuery", inline_query_id=q["id"], results=[], cache_time=1,
+                          switch_pm_text="Как создать оффер", switch_pm_parameter="help")
+    parsed, error = parse_offer(query)
+    if error:
+        result = {"type": "article", "id": "err", "title": "Не распознал ссылку или сумму",
+                  "description": error,
+                  "input_message_content": {"message_text": f"⚠️ {esc(error)}\n\n{USAGE}", "parse_mode": "HTML"}}
+        return await api("answerInlineQuery", inline_query_id=q["id"], results=[result], cache_time=1)
+    oid = uuid.uuid4().hex[:8]
+    o = inline_preview(oid, parsed, q["from"])
+    result = {"type": "article", "id": oid, "title": f"Оффер: {parsed['name']}",
+              "description": f"{num(parsed['stars'])} ⭐ — нажми, чтобы отправить сюда",
+              "input_message_content": {"message_text": offer_text(o), "parse_mode": "HTML",
+                                        "link_preview_options": {"is_disabled": True}},
+              "reply_markup": offer_kb(o)}
+    await api("answerInlineQuery", inline_query_id=q["id"], results=[result], cache_time=1)
+
+
+# ── личка с ботом ───────────────────────────────────────────
+
+def start_text(connected):
+    base = (f"👋 <b>Оффер-бот @{esc(bot_name)}</b>\n\n"
+            "Создаёт офферы на NFT: карточка с ценой и кнопками «Принять» / «Отклонить», как в самом Telegram.\n\n"
+            "<b>Способ 1 — инлайн, без настроек</b>\n"
+            f"В любом чате напиши <code>@{esc(bot_name)}</code>, затем через пробел ссылку на подарок и сумму, "
+            f"например:\n<code>@{esc(bot_name)} https://t.me/nft/DurovsCap-1234 500</code>\n"
+            "Сверху появится карточка — нажми на неё, и оффер уйдёт в этот чат.")
+    if connected:
+        business = ("<b>Способ 2 — через Telegram Business (подключён)</b>\n"
+                    "В чате с человеком напиши:\n<code>/offer ссылка сумма</code>\n"
+                    "Оффер уйдёт от твоего имени, без пометки «через бота».")
+    else:
+        business = ("<b>Способ 2 — через Telegram Business</b>\n"
+                    "Если хочешь, чтобы оффер выглядел отправленным от тебя (нужен Premium):\n"
+                    "Настройки → Telegram Business → Чат-боты → вставь ник бота → оставь разрешение "
+                    "«Отвечать на сообщения» → Добавить.")
+    return f"{base}\n\n{business}"
+
+
+async def on_message(m):
+    chat, frm = m["chat"]["id"], m.get("from") or {}
+    cmd, _, arg = (m.get("text") or "").strip().partition(" ")
+    cmd = cmd.split("@")[0].lower()
+    if cmd in ("/start", "/help"):
+        connected = any(c["user_id"] == frm.get("id") and c["enabled"] for c in connections.values())
+        kb = None if connected else {"inline_keyboard": [[{"text": "📋 Скопировать ник бота",
+                                                           "copy_text": {"text": f"@{bot_name}"}}]]}
+        await send(chat, start_text(connected), kb)
+    elif cmd == "/offer":
+        if not arg.strip():
+            return await send(chat, USAGE)
+        maker = {"id": frm.get("id", 0), "name": frm.get("first_name", ""), "username": frm.get("username")}
+        await create_offer(arg, maker, chat, "предпросмотр", None, chat)
+
+
+async def handle(update):
+    try:
+        if "business_connection" in update:
+            await on_connection(update["business_connection"])
+        elif "business_message" in update:
+            await on_business_message(update["business_message"])
+        elif "callback_query" in update:
+            await on_callback(update["callback_query"])
+        elif "inline_query" in update:
+            await on_inline_query(update["inline_query"])
+        elif "message" in update:
+            await on_message(update["message"])
+    except Exception:
+        log.exception("апдейт %s", update.get("update_id"))
+
+
+# ── запуск ──────────────────────────────────────────────────
+
+async def webhook(req):
+    token = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(token.encode(), SECRET.encode()):
+        return web.Response(status=403)
+    try:
+        update = await req.json()
+    except ValueError:
+        return web.Response(status=400)
+    background(handle(update))
+    return web.Response(text="ok")
+
+
+async def health(req):
+    return web.Response(text="ok")
+
+
+async def keepalive():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with http.get(f"{PUBLIC_URL}/health") as resp:
+                await resp.read()
+        except Exception as e:
+            log.warning("keepalive: %s", e)
+
+
+async def poll_updates():
+    """Для запуска без публичного адреса: удобно проверять у себя на компьютере."""
+    await api("deleteWebhook")
+    offset = 0
+    while True:
+        try:
+            data = await api("getUpdates", offset=offset, timeout=30, allowed_updates=UPDATES)
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                background(handle(update))
+            if not data.get("ok"):
+                await asyncio.sleep(3)
+        except Exception as e:
+            log.warning("getUpdates: %s", e)
+            await asyncio.sleep(3)
+
+
+async def main():
+    global http, bot_name
+    http = ClientSession(timeout=ClientTimeout(total=70))
+    load()
+    me = (await api("getMe")).get("result") or {}
+    if not me:
+        raise SystemExit("BOT_TOKEN не подходит")
+    bot_name = me["username"]
+    log.info("юзернейм бота: @%s (https://t.me/%s)", bot_name, bot_name)
+    if not me.get("can_connect_to_business"):
+        log.warning("У бота выключен Business Mode: BotFather → Bot Settings → Business Mode "
+                   "(не мешает инлайн-режиму — он работает и без этого)")
+    if me.get("supports_inline_queries") is False:
+        log.warning("У бота выключен инлайн-режим: BotFather → /setinline → включить для @%s", bot_name)
+    await api("setMyCommands", commands=[{"command": "start", "description": "Подключение и подсказки"},
+                                         {"command": "offer", "description": "Предпросмотр оффера: ссылка сумма"}])
+    background(sweeper())
+    if PUBLIC_URL:
+        app = web.Application()
+        app.router.add_get("/health", health)
+        app.router.add_post("/webhook", webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+        await api("setWebhook", url=f"{PUBLIC_URL}/webhook", secret_token=SECRET,
+                  allowed_updates=UPDATES, drop_pending_updates=True)
+        background(keepalive())
+    else:
+        background(poll_updates())
+    log.info("оффер-бот @%s запущен", bot_name)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
