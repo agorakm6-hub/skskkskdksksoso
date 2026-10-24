@@ -29,6 +29,9 @@ MAX_STARS = 100_000_000
 UPDATES = ["message", "callback_query", "business_connection", "business_message"]
 NBSP = "\u00a0"
 
+# задержка между "OFFER" и редактированием в карточку (сек)
+OFFER_EDIT_DELAY = float(os.environ.get("OFFER_EDIT_DELAY", "0.7"))
+
 http = None
 bot_name = ""
 connections, offers = {}, {}
@@ -64,8 +67,7 @@ async def api(method, **params):
 
 async def send(chat, text, kb=None, bcid=None, preview=False):
     params = dict(chat_id=chat, text=text, parse_mode="HTML")
-    if not preview:
-        params["link_preview_options"] = {"is_disabled": True}
+    params["link_preview_options"] = {"is_disabled": not preview}
     if kb:
         params["reply_markup"] = kb
     if bcid:
@@ -77,11 +79,11 @@ async def delete_business_message(bcid, mid):
     return await api("deleteBusinessMessages", business_connection_id=bcid, message_ids=[mid])
 
 
-async def edit_offer(o, text, kb=None, preview=False):
+async def edit_offer(o, text, kb=None, preview=True):
     params = dict(chat_id=o["chat"], message_id=o["mid"], business_connection_id=o["bcid"],
                   text=text, parse_mode="HTML", reply_markup=kb or {"inline_keyboard": []})
-    if not preview:
-        params["link_preview_options"] = {"is_disabled": True}
+    # важно: при editMessageText превью по умолчанию выключено — включаем явно
+    params["link_preview_options"] = {"is_disabled": not preview}
     res = await api("editMessageText", **params)
     if not res.get("ok") and "not modified" in (res.get("description") or "").lower():
         return {"ok": True}
@@ -201,14 +203,15 @@ async def make_offer(m, maker, bcid):
     cmd, _, arg = (m.get("text") or "").partition(" ")
     parsed, error = parse_offer(arg)
     chat = m["chat"]["id"]
+    # 1) удаляем команду
     await delete_business_message(bcid, m["message_id"])
     if error:
         return await send(chat, f"⚠️ {esc(error)}\n\n{USAGE}", bcid=bcid)
     now = time.time()
     o = {"id": uuid.uuid4().hex[:8], **parsed, "bcid": bcid, "chat": chat, "mid": None, "maker": maker,
          "status": "pending", "created": now, "expires": now + OFFER_TTL}
-    # 1) отправляем заглушку OFFER
-    res = await send(chat, "OFFER", bcid=bcid)
+    # 2) отправляем заглушку OFFER (без превью)
+    res = await send(chat, "OFFER", bcid=bcid, preview=False)
     if not res.get("ok"):
         desc = res.get("description", "")
         if "PEER_FLOOD" in desc:
@@ -219,7 +222,8 @@ async def make_offer(m, maker, bcid):
     o["mid"] = res["result"]["message_id"]
     offers[o["id"]] = o
     save()
-    # 2) редактируем заглушку в карточку оффера
+    # 3) пауза и редактирование в карточку с превью (картинка NFT)
+    await asyncio.sleep(OFFER_EDIT_DELAY)
     edit_res = await edit_offer(o, offer_text(o), offer_kb(o), preview=True)
     if not edit_res.get("ok"):
         log.warning("не удалось отредактировать OFFER %s: %s", o["id"], edit_res.get("description"))
@@ -232,7 +236,7 @@ async def settle(o, status):
     text, kb = FINAL[status]
     o["status"] = status
     save()
-    await edit_offer(o, text(o), kb(o) if kb else None)
+    await edit_offer(o, text(o), kb(o) if kb else None, preview=True)
 
 
 async def sweeper():
@@ -245,7 +249,7 @@ async def sweeper():
                 if o["expires"] < time.time():
                     await settle(o, "expired")
                 else:
-                    await edit_offer(o, offer_text(o), offer_kb(o))
+                    await edit_offer(o, offer_text(o), offer_kb(o), preview=True)
             except Exception:
                 log.exception("тик оффера %s", o["id"])
 
