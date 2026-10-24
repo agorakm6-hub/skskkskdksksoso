@@ -248,7 +248,9 @@ async def sweeper():
                     await edit_offer(o, offer_text(o), offer_kb(o))
             except Exception:
                 log.exception("тик оффера %s", o["id"])
-              async def on_callback(q):
+
+
+async def on_callback(q):
     parts = q.get("data", "").split(":")
     note = None
     o = offers.get(parts[2]) if len(parts) == 3 and parts[0] == "of" else None
@@ -294,6 +296,134 @@ async def on_connection(c):
                 "Автоматизация чатов, выбери бота и включи это право — иначе офферы не создадутся.")
     else:
         text = ("✅ <b>Готово, бот подключён.</b>\n\n"
+                "В любом чате напиши:\n<code>/offer ссылка сумма</code>\n"
+                "Например: <code>/offer https://t.me/nft/DurovsCap-1234 500</code>\n\n"
+                "Сообщение тут же превратится в карточку оффера с кнопками.")
+        if not conn["can_delete"]:
+            text += ("\n\n⚠️ Без права «Удалять сообщения» твоя команда останется в чате рядом с карточкой — "
+                     "включи его в тех же настройках, чтобы она пропадала.")
+    await send(conn["chat"], text)
+
+
+async def get_connection(bcid):
+    conn = connections.get(bcid)
+    if conn is None:
+        res = await api("getBusinessConnection", business_connection_id=bcid)
+        if res.get("ok"):
+            conn = connections[bcid] = conn_from(res["result"])
+            save()
+    return conn
+
+
+async def on_business_message(m):
+    if (m.get("text") or "").partition(" ")[0].lower() != "/offer":
+        return
+    conn = await get_connection(m["business_connection_id"])
+    frm = m.get("from") or {}
+    if not conn or frm.get("id") != conn["user_id"]:
+        return
+    if not (conn["enabled"] and conn["can_reply"]):
+        return await send(conn["chat"], "⚠️ У бота нет права отвечать на сообщения, оффер не создан. "
+                                        "Включи его: Настройки → Телеграм Бизнес → Автоматизация чатов.")
+    maker = {"id": frm["id"], "name": frm.get("first_name", ""), "username": frm.get("username")}
+    await make_offer(m, maker, conn["id"])
+
+
+async def on_message(m):
+    chat = m["chat"]["id"]
+    cmd = (m.get("text") or "").strip().split()[:1]
+    cmd = cmd[0].split("@")[0].lower() if cmd else ""
+    if cmd in ("/start", "/help"):
+        kb = {"inline_keyboard": [[{"text": "📋 Скопировать юзернейм бота",
+                                    "copy_text": {"text": f"@{bot_name}"}}]]}
+        await send(chat, "👋 Привет!", kb)
+
+
+async def handle(update):
+    try:
+        if "business_connection" in update:
+            await on_connection(update["business_connection"])
+        elif "business_message" in update:
+            await on_business_message(update["business_message"])
+        elif "callback_query" in update:
+            await on_callback(update["callback_query"])
+        elif "message" in update:
+            await on_message(update["message"])
+    except Exception:
+        log.exception("апдейт %s", update.get("update_id"))
+
+
+async def webhook(req):
+    token = req.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(token.encode(), SECRET.encode()):
+        return web.Response(status=403)
+    try:
+        update = await req.json()
+    except ValueError:
+        return web.Response(status=400)
+    background(handle(update))
+    return web.Response(text="ok")
+
+
+async def health(req):
+    return web.Response(text="ok")
+
+
+async def keepalive():
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with http.get(f"{PUBLIC_URL}/health") as resp:
+                await resp.read()
+        except Exception as e:
+            log.warning("keepalive: %s", e)
+
+
+async def poll_updates():
+    await api("deleteWebhook")
+    offset = 0
+    while True:
+        try:
+            data = await api("getUpdates", offset=offset, timeout=30, allowed_updates=UPDATES)
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                background(handle(update))
+            if not data.get("ok"):
+                await asyncio.sleep(3)
+        except Exception as e:
+            log.warning("getUpdates: %s", e)
+            await asyncio.sleep(3)
+
+
+async def main():
+    global http, bot_name
+    http = ClientSession(timeout=ClientTimeout(total=70))
+    load()
+    me = (await api("getMe")).get("result") or {}
+    if not me:
+        raise SystemExit("BOT_TOKEN не подходит")
+    bot_name = me["username"]
+    log.info("юзернейм бота: @%s (https://t.me/%s)", bot_name, bot_name)
+    await api("setMyCommands", commands=[{"command": "start", "description": "Подключение"}])
+    background(sweeper())
+    if PUBLIC_URL:
+        app = web.Application()
+        app.router.add_get("/health", health)
+        app.router.add_post("/webhook", webhook)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", int(os.environ.get("PORT", 10000))).start()
+        await api("setWebhook", url=f"{PUBLIC_URL}/webhook", secret_token=SECRET,
+                  allowed_updates=UPDATES, drop_pending_updates=True)
+        background(keepalive())
+    else:
+        background(poll_updates())
+    log.info("оффер-бот @%s запущен", bot_name)
+    await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    asyncio.run(main()) <b>Готово, бот подключён.</b>\n\n"
                 "В любом чате напиши:\n<code>/offer ссылка сумма</code>\n"
                 "Например: <code>/offer https://t.me/nft/DurovsCap-1234 500</code>\n\n"
                 "Сообщение тут же превратится в карточку оффера с кнопками.")
